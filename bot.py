@@ -3,67 +3,84 @@ from discord.ext import commands
 from discord import app_commands
 import aiohttp
 import os
-from dotenv import load_dotenv
+from datetime import datetime
 
-load_dotenv()
-
-TOKEN = os.getenv("DISCORD_TOKEN")
-HYPIXEL_API_KEY = os.getenv("HYPIXEL_API_KEY")
-STAFF_ROLE_ID = int(os.getenv("STAFF_ROLE_ID"))
+# --- CONFIG ---
+DISCORD_TOKEN = "your_discord_bot_token"
+HYPIXEL_API_KEY = "your_hypixel_api_key"
+STAFF_ROLE_ID =   # staff role as integer
+GUILD_NAME = "your_guild_name"
 
 intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="d!", intents=intents)
-
+bot = commands.Bot(command_prefix="!", intents=intents)
 HYPIXEL_BASE = "https://api.hypixel.net"
 
-
-# ------------- Helpers -----------------
+# --- Helpers ---
 
 async def fetch_json(session, url, params=None):
     async with session.get(url, params=params) as resp:
         return await resp.json()
 
+def circle(color: str) -> str:
+    return {
+        "green": ":green_circle:",
+        "yellow": ":yellow_circle:",
+        "red": ":red_circle:"
+    }.get(color, ":white_circle:")
 
-def get_circle_color(bedwars_wins, gexp):
-    meets_wins = bedwars_wins >= 2500
-    meets_gexp = gexp >= 100000
+def get_bedwars_rating(wins, stars):
+    return wins >= 2500 and stars >= 300
 
-    if meets_wins and meets_gexp:
-        return ":green_circle:"
-    elif meets_wins or meets_gexp:
-        return ":yellow_circle:"
+def get_duels_rating(wins, wlr):
+    return wins >= 7500 and wlr >= 2.5
+
+def get_skywars_rating(stars):
+    return stars >= 10
+
+def get_skyblock_rating(level):
+    return level >= 140
+
+def get_guild_circle(gexp):
+    if gexp >= 100000:
+        return "green"
     else:
-        return ":red_circle:"
+        return "red"
 
+async def get_uuid(session, username):
+    url = f"https://api.mojang.com/users/profiles/minecraft/{username}"
+    data = await fetch_json(session, url)
+    return data.get("id")
 
-async def get_guild_data(session):
-    """Fetch guild members and stats."""
-    url = f"{HYPIXEL_BASE}/guild"
-    params = {"key": HYPIXEL_API_KEY, "name": "YOUR_GUILD_NAME"}
-    data = await fetch_json(session, url, params)
-
-    if not data.get("success"):
-        return None
-
-    return data["guild"]["members"]
-
-
-async def get_player_stats(session, uuid):
-    """Fetch player stats."""
+async def get_player_data(session, uuid):
     url = f"{HYPIXEL_BASE}/player"
-    params = {"key": HYPIXEL_API_KEY, "uuid": uuid}
-    data = await fetch_json(session, url, params)
+    data = await fetch_json(session, url, {"key": HYPIXEL_API_KEY, "uuid": uuid})
+    return data.get("player")
 
-    if not data.get("success") or not data.get("player"):
-        return None
+async def get_guild_by_player(session, uuid):
+    url = f"{HYPIXEL_BASE}/guild"
+    data = await fetch_json(session, url, {"key": HYPIXEL_API_KEY, "player": uuid})
+    return data.get("guild")
 
-    player = data["player"]
-    bedwars_wins = player.get("stats", {}).get("Bedwars", {}).get("wins_bedwars", 0)
-    gexp = player.get("gexp", 0)  
-    return bedwars_wins, gexp, player.get("displayname", "Unknown")
+async def get_guild_by_name(session):
+    url = f"{HYPIXEL_BASE}/guild"
+    data = await fetch_json(session, url, {"key": HYPIXEL_API_KEY, "name": GUILD_NAME})
+    return data.get("guild")
 
+def get_weekly_gexp(exp_history):
+    return sum(exp_history.values())
 
-# ------------- Commands -----------------
+# --- Staff Check ---
+
+def is_staff():
+    async def predicate(interaction: discord.Interaction):
+        role = discord.utils.get(interaction.user.roles, id=STAFF_ROLE_ID)
+        if role:
+            return True
+        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+        return False
+    return app_commands.check(predicate)
+
+# --- Events ---
 
 @bot.event
 async def on_ready():
@@ -72,39 +89,132 @@ async def on_ready():
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} commands")
     except Exception as e:
-        print(e)
+        print(f"Failed to sync commands: {e}")
 
+# --- /reqcheck Command ---
 
-def is_staff():
-    async def predicate(interaction: discord.Interaction):
-        staff_role = discord.utils.get(interaction.guild.roles, id=STAFF_ROLE_ID)
-        if staff_role in interaction.user.roles:
-            return True
-        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
-        return False
-    return app_commands.check(predicate)
+@bot.tree.command(name="reqcheck", description="Check a player's stats against guild requirements")
+@app_commands.describe(username="Minecraft username")
+@is_staff()
+async def reqcheck(interaction: discord.Interaction, username: str):
+    await interaction.response.defer()
 
+    async with aiohttp.ClientSession() as session:
+        uuid = await get_uuid(session, username)
+        if not uuid:
+            return await interaction.followup.send("❌ Could not find that player.")
 
-@bot.tree.command(name="guildcheck", description="Check all guild members against requirements")
+        player = await get_player_data(session, uuid)
+        if not player:
+            return await interaction.followup.send("❌ Failed to fetch player data.")
+
+        name = player.get("displayname", "Unknown")
+        stats = player.get("stats", {})
+        achievements = player.get("achievements", {})
+
+        guild = await get_guild_by_player(session, uuid)
+        gexp = 0
+        guild_name = "None"
+        if guild:
+            guild_name = guild.get("name", "Unknown")
+            member = next((m for m in guild["members"] if m["uuid"] == uuid), None)
+            if member:
+                gexp = get_weekly_gexp(member.get("expHistory", {}))
+
+        # Bedwars
+        bedwars_wins = stats.get("Bedwars", {}).get("wins_bedwars", 0)
+        bedwars_stars = achievements.get("bedwars_level", 0)
+        fk = stats.get("Bedwars", {}).get("final_kills_bedwars", 0)
+        fd = stats.get("Bedwars", {}).get("final_deaths_bedwars", 1)
+        fkdr = round(fk / max(1, fd), 2)
+        bedwars_ok = get_bedwars_rating(bedwars_wins, bedwars_stars)
+
+        # Duels
+        duels_wins = stats.get("Duels", {}).get("wins", 0)
+        duels_losses = stats.get("Duels", {}).get("losses", 1)
+        duels_kills = stats.get("Duels", {}).get("kills", 0)
+        duels_wlr = round(duels_wins / max(1, duels_losses), 2)
+        duels_ok = get_duels_rating(duels_wins, duels_wlr)
+
+        # Skywars
+        skywars_stars = achievements.get("skywars_you_re_a_star", 0)
+        skywars_wins = stats.get("SkyWars", {}).get("wins", 0)
+        skywars_losses = stats.get("SkyWars", {}).get("losses", 1)
+        skywars_wlr = round(skywars_wins / max(1, skywars_losses), 2)
+        skywars_ok = get_skywars_rating(skywars_stars)
+
+        # Skyblock
+        skyblock_level = achievements.get("skyblock_leveling", 0)
+        skyblock_ok = get_skyblock_rating(skyblock_level)
+
+        # Embed
+        embed = discord.Embed(
+            description=f"Below is the requirement check for **{name}**!",
+            color=discord.Color.dark_purple()
+        )
+        embed.set_author(name=f"{name} | {guild_name}", icon_url=f"https://minotar.net/helm/{name}/150.png")
+        embed.set_image(url="https://cdn.discordapp.com/attachments/1058519179973623888/1058695976132546570/that-was-pointless-1.png?ex=6853e8f6&is=68529776&hm=43223e59bdfd1e475618961f643442e7fafca92380c022414ae54005698f57cf&")
+
+        embed.add_field(
+            name=f"Bedwars {circle('green' if bedwars_ok else 'red')}",
+            value=f"Wins: **{bedwars_wins}**\nStars: **{bedwars_stars}**\nFKDR: **{fkdr}**", inline=True)
+        embed.add_field(
+            name=f"Duels {circle('green' if duels_ok else 'red')}",
+            value=f"Wins: **{duels_wins}**\nWLR: **{duels_wlr}**\nKills: **{duels_kills}**", inline=True)
+        embed.add_field(
+            name=f"Skywars {circle('green' if skywars_ok else 'red')}",
+            value=f"Stars: **{skywars_stars}**\nWLR: **{skywars_wlr}**", inline=True)
+        embed.add_field(
+            name=f"Skyblock {circle('green' if skyblock_ok else 'red')}",
+            value=f"Level: **{skyblock_level}**\nNetworth: **N/A**", inline=True)
+        embed.add_field(
+            name="Guild",
+            value=f"Current Guild: **{guild_name}**\nGEXP: **{gexp}**", inline=True)
+        embed.set_footer(text=f"Today at {datetime.now().strftime('%H:%M')} | Defeat Guild")
+
+        await interaction.followup.send(embed=embed)
+
+# --- /guildcheck Command ---
+
+@bot.tree.command(name="guildcheck", description="Check all guild members against GEXP/Bedwars requirements")
 @app_commands.describe(sort="Sort players by 'bedwars' or 'gexp'")
 @is_staff()
 async def guildcheck(interaction: discord.Interaction, sort: str = None):
     await interaction.response.defer()
 
     async with aiohttp.ClientSession() as session:
-        guild_members = await get_guild_data(session)
-        if not guild_members:
-            return await interaction.followup.send("Failed to fetch guild data.")
-
+        guild = await get_guild_by_name(session)
+        if not guild:
+            return await interaction.followup.send("❌ Failed to fetch guild data.")
+        
+        members = guild.get("members", [])
         results = []
-        for member in guild_members:
-            uuid = member["uuid"]
-            gexp = member.get("expHistory", {}).get("0", 0)  
-            player_stats = await get_player_stats(session, uuid)
-            if player_stats:
-                bedwars_wins, _, name = player_stats
-                circle = get_circle_color(bedwars_wins, gexp)
-                results.append((circle, name, bedwars_wins, gexp))
+
+        for m in members:
+            uuid = m["uuid"]
+            gexp = get_weekly_gexp(m.get("expHistory", {}))
+            try:
+                player = await get_player_data(session, uuid)
+                if not player:
+                    continue
+                name = player.get("displayname", "Unknown")
+                stats = player.get("stats", {})
+                achievements = player.get("achievements", {})
+                bedwars_wins = stats.get("Bedwars", {}).get("wins_bedwars", 0)
+                bedwars_stars = achievements.get("bedwars_level", 0)
+                bw_ok = get_bedwars_rating(bedwars_wins, bedwars_stars)
+                gexp_ok = gexp >= 100000
+
+                if bw_ok and gexp_ok:
+                    status = "green"
+                elif bw_ok or gexp_ok:
+                    status = "yellow"
+                else:
+                    status = "red"
+
+                results.append((circle(status), name, bedwars_wins, gexp))
+            except Exception:
+                continue
 
         if sort == "bedwars":
             results.sort(key=lambda x: x[2], reverse=True)
@@ -113,52 +223,18 @@ async def guildcheck(interaction: discord.Interaction, sort: str = None):
 
         embed = discord.Embed(
             title="Guild Requirement Check",
-            description="Bedwars Wins ≥ 2500 | Weekly GEXP ≥ 100k",
+            description="Shows Bedwars Wins + Weekly GEXP requirement compliance.",
             color=discord.Color.blue()
         )
-        for circle, name, wins, gexp in results:
+        embed.set_image(url="https://cdn.discordapp.com/attachments/1058519179973623888/1058695976132546570/that-was-pointless-1.png?ex=6853e8f6&is=68529776&hm=43223e59bdfd1e475618961f643442e7fafca92380c022414ae54005698f57cf&")
+
+        for emoji, name, wins, gexp in results:
             embed.add_field(
-                name=f"{circle} | {name}",
+                name=f"{emoji} | {name}",
                 value=f"**Bedwars Wins:** {wins}\n**GEXP:** {gexp}",
                 inline=False
             )
 
         await interaction.followup.send(embed=embed)
 
-
-@bot.tree.command(name="reqcheck", description="Check requirements for a specific player")
-@app_commands.describe(username="Minecraft username")
-@is_staff()
-async def reqcheck(interaction: discord.Interaction, username: str):
-    await interaction.response.defer()
-
-    async with aiohttp.ClientSession() as session:
-        
-        url = f"https://api.mojang.com/users/profiles/minecraft/{username}"
-        mojang_data = await fetch_json(session, url)
-        if "id" not in mojang_data:
-            return await interaction.followup.send("Could not find that player.")
-
-        uuid = mojang_data["id"]
-        player_stats = await get_player_stats(session, uuid)
-        if not player_stats:
-            return await interaction.followup.send("Failed to fetch player stats.")
-
-        bedwars_wins, gexp, name = player_stats
-        circle = get_circle_color(bedwars_wins, gexp)
-
-        embed = discord.Embed(
-            title="Defeat Requirement Check",
-            description=f"Below is the requirement check for **{name}**!",
-            color=discord.Color.purple()
-        )
-        embed.add_field(
-            name=f"{circle} {name}",
-            value=f"**Bedwars Wins:** {bedwars_wins}\n**GEXP:** {gexp}",
-            inline=False
-        )
-
-        await interaction.followup.send(embed=embed)
-
-
-bot.run(TOKEN)
+bot.run(DISCORD_TOKEN)
